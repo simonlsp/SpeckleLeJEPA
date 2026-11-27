@@ -5,13 +5,18 @@ import argparse
 import logging
 import re
 import sys
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
 import torch
 
-from speckle_lejepa import CellBatchStream, MixedPrecision, SpeckleLeJEPA
+from speckle_lejepa import CellBatch, CellBatchStream, MixedPrecision, SpeckleLeJEPA
+from speckle_lejepa.data import EpochStats
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,28 @@ def save_checkpoint(directory: Path, state: dict, max_saved_checkpoints: int | N
             logger.info("checkpoint_removed epoch=%d path=%s", epoch, old_path)
 
 
+def training_batches(stream: CellBatchStream) -> Iterator[tuple[CellBatch, EpochStats]]:
+    if not (stream.cell_workers or stream.image_workers):
+        for batch in stream:
+            yield batch, stream.stats
+        return
+
+    with closing(iter(stream)) as batches, ThreadPoolExecutor(1, thread_name_prefix="batch-prep") as producer:
+        def prepare_next() -> tuple[CellBatch | None, EpochStats]:
+            return next(batches, None), replace(stream.stats)
+
+        pending = producer.submit(prepare_next)
+        try:
+            while True:
+                batch, stats = pending.result()
+                if batch is None:
+                    break
+                pending = producer.submit(prepare_next)
+                yield batch, stats
+        finally:
+            pending.cancel()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("index_path", type=Path, help="Path to a trusted ImageIndex NPY")
@@ -57,6 +84,10 @@ def main() -> None:
     parser.add_argument(
         "--max-cell-per-image", "--max_cell_per_image", type=positive_int, help="Instance limit per image per epoch (default: all)"
     )
+    parser.add_argument("--cell-workers", "--cell_workers", type=int, default=4,
+                        help="Threads for creating cell views (default: 4, 0 uses serial preparation)")
+    parser.add_argument("--image-workers", "--image_workers", type=int, default=2,
+                        help="Threads for reading and decoding replacement images (default: 2, 0 disables read-ahead)")
     parser.add_argument("--epochs", type=positive_int, help="Final epoch number. Defaults to running one epoch.")
     parser.add_argument("--lr", type=float, help="AdamW learning rate (default for new runs: 5e-4)")
     parser.add_argument("--seed", type=int, default=0)
@@ -71,6 +102,8 @@ def main() -> None:
         "--log-interval", "--log_interval", type=positive_int, default=100, help="Log every N batches (default: 100)"
     )
     args = parser.parse_args()
+    if args.cell_workers < 0 or args.image_workers < 0:
+        parser.error("--cell-workers and --image-workers must be nonnegative")
     if args.output.exists() and not args.output.is_dir():
         parser.error(f"--output must be a directory: {args.output}")
     checkpoints = find_checkpoints(args.output)
@@ -102,6 +135,8 @@ def main() -> None:
         max_image_per_gene=args.max_image_per_gene,
         max_cell_per_image=args.max_cell_per_image,
         seed=args.seed,
+        cell_workers=args.cell_workers,
+        image_workers=args.image_workers,
     )
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -130,10 +165,12 @@ def main() -> None:
 
     logger.info(
         "training_started index=%s output=%s epochs=%d..%d images=%d batch_size=%d device=%s precision=%s "
-        "lr=%g seed=%d max_image_per_gene=%s max_cell_per_image=%s max_saved_checkpoints=%s",
+        "lr=%g seed=%d max_image_per_gene=%s max_cell_per_image=%s max_saved_checkpoints=%s "
+        "cell_workers=%d image_workers=%d",
         args.index_path, args.output, completed_epochs + 1, final_epoch, len(stream.records), stream.batch_size,
         device, precision.dtype or torch.float32, optimizer.param_groups[0]["lr"], args.seed,
         args.max_image_per_gene, args.max_cell_per_image, args.max_saved_checkpoints,
+        args.cell_workers, args.image_workers,
     )
 
     for epoch in range(completed_epochs + 1, final_epoch + 1):
@@ -144,7 +181,7 @@ def main() -> None:
             torch.cuda.reset_peak_memory_stats(device)
         totals = torch.zeros(3, device=device, dtype=torch.float32)
         steps = 0
-        for steps, batch in enumerate(stream, start=1):
+        for steps, (batch, stats) in enumerate(training_batches(stream), start=1):
             global_views = batch.global_views.to(device)
             local_views = batch.local_views.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -159,7 +196,6 @@ def main() -> None:
             if steps == 1 or steps % args.log_interval == 0:
                 total, prediction, sigreg = values.tolist()
                 elapsed = perf_counter() - started
-                stats = stream.stats
                 logger.info(
                     "batch epoch=%d step=%d global_step=%d batch_size=%d loss=%.6f prediction=%.6f sigreg=%.6f "
                     "images=%d/%d cells=%d skipped_cells=%d elapsed_s=%.2f cells_per_s=%.2f",

@@ -4,7 +4,9 @@ import heapq
 import os
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
 
@@ -48,6 +50,22 @@ class EpochStats:
 def load_image_index(index_path: str | Path) -> tuple[ImageRecord, ...]:
     """Read a trusted [gene-to-wells, id-to-wells, well-to-images] pickled NPY."""
     index_path = Path(index_path).absolute()
+    _, records = _read_image_index(index_path)
+    if not records:
+        raise ValueError(f"No indexed RGB/mask pairs found in {index_path}.")
+    return records
+
+
+def load_gene_index(index_path: str | Path) -> dict[str, list[ImageRecord]]:
+    """Group a trusted image index by gene, retaining genes without images."""
+    genes, records = _read_image_index(Path(index_path).absolute())
+    by_gene: dict[str, list[ImageRecord]] = {gene: [] for gene in genes}
+    for record in records:
+        by_gene[record.gene].append(record)
+    return by_gene
+
+
+def _read_image_index(index_path: Path) -> tuple[tuple[str, ...], tuple[ImageRecord, ...]]:
     index = np.load(index_path, allow_pickle=True)
     if not isinstance(index, np.ndarray) or index.shape != (3,):
         raise ValueError(f"{index_path} must contain the three legacy index dictionaries.")
@@ -70,9 +88,7 @@ def load_image_index(index_path: str | Path) -> tuple[ImageRecord, ...]:
                 previous = by_image.setdefault(rgb_path, record)
                 if previous != record:
                     raise ValueError(f"Conflicting gene or mask entries for RGB image {rgb_path}.")
-    if not by_image:
-        raise ValueError(f"No indexed RGB/mask pairs found in {index_path}.")
-    return tuple(by_image.values())
+    return tuple(str(gene) for gene in genes), tuple(by_image.values())
 
 
 def _index_path(directory: Path, value: str | os.PathLike) -> PurePath:
@@ -113,9 +129,10 @@ def _decode(path: PurePath) -> np.ndarray:
         raise OSError(f"Cannot read PNG {path}: {error}") from error
 
 
-def _load_image(
-    record: ImageRecord, rng: np.random.Generator, max_cell_per_image: int | None = None
+def load_cell_image(
+    record: ImageRecord, rng: np.random.Generator | None = None, max_cell_per_image: int | None = None
 ) -> _CachedImage:
+    """Decode one image pair and collect instances in label order unless shuffled."""
     rgb = _decode(record.rgb_path)
     mask = _decode(record.mask_path)
     if rgb.shape[0] != 3 or rgb.dtype not in (np.uint8, np.uint16):
@@ -142,7 +159,8 @@ def _load_image(
         for label in np.flatnonzero(bottom):
             box = (int(top[label]), int(left[label]), int(bottom[label]), int(right[label]))
             instances.append(_Instance(int(label), box))
-        rng.shuffle(instances)
+        if rng is not None:
+            rng.shuffle(instances)
         if max_cell_per_image is not None:
             del instances[max_cell_per_image:]
     return _CachedImage(record, rgb, labels, instances)
@@ -155,10 +173,15 @@ class _ImagePool:
         rng: np.random.Generator,
         stats: EpochStats,
         max_cell_per_image: int | None,
+        readers: ThreadPoolExecutor | None,
+        read_ahead: int,
     ) -> None:
         self.rng = rng
         self.stats = stats
         self.max_cell_per_image = max_cell_per_image
+        self.readers = readers
+        self.read_ahead = read_ahead
+        self.reads: dict[ImageRecord, Future[_CachedImage]] = {}
         self.pending: dict[str, list[ImageRecord]] = defaultdict(list)
         self.active: dict[str, int] = defaultdict(int)
         self.generations: dict[str, int] = defaultdict(int)
@@ -178,10 +201,20 @@ class _ImagePool:
 
     def acquire(self) -> _CachedImage | None:
         while self.heap:
+            self.prefetch()
+            if not self.heap:
+                break
             _, _, gene, generation = heapq.heappop(self.heap)
             if generation != self.generations[gene]:
                 continue
-            image = _load_image(self.pending[gene].pop(), self.rng, self.max_cell_per_image)
+            record = self.pending[gene].pop()
+            read = self.reads.pop(record, None)
+            image = load_cell_image(record) if read is None else read.result()
+            # Sampling stays on the coordinator and follows the original acquisition order.
+            if image.instances:
+                self.rng.shuffle(image.instances)
+                if self.max_cell_per_image is not None:
+                    del image.instances[self.max_cell_per_image:]
             self.stats.decoded_images += 1
             if image.instances:
                 self.active[gene] += 1
@@ -192,13 +225,32 @@ class _ImagePool:
             self._schedule(gene)
         return None
 
+    def prefetch(self) -> None:
+        if self.readers is None or len(self.reads) >= self.read_ahead:
+            return
+        candidates = []
+        while self.heap and len(candidates) < self.read_ahead:
+            entry = heapq.heappop(self.heap)
+            gene, generation = entry[2:]
+            if generation == self.generations[gene]:
+                candidates.append(entry)
+        for entry in candidates:
+            heapq.heappush(self.heap, entry)
+        # Try one image per candidate gene first. With fewer genes, look farther into their queues.
+        for records in zip_longest(*(reversed(self.pending[entry[2]]) for entry in candidates)):
+            for record in records:
+                if record is not None and record not in self.reads:
+                    self.reads[record] = self.readers.submit(load_cell_image, record)
+                    if len(self.reads) == self.read_ahead:
+                        return
+
     def release(self, gene: str) -> None:
         self.active[gene] -= 1
         self._schedule(gene)
 
 
 class CellBatchStream(IterableDataset):
-    """Yield prebatched views, using at most ceil(batch_size / cells_per_image) cached pairs."""
+    """Yield prebatched views from a bounded active pool and optional worker threads."""
 
     def __init__(
         self,
@@ -210,12 +262,16 @@ class CellBatchStream(IterableDataset):
         max_cell_per_image: int | None = None,
         views: CellViews | None = None,
         seed: int = 0,
+        cell_workers: int = 0,
+        image_workers: int = 0,
     ) -> None:
         super().__init__()
         if not 1 <= cells_per_image <= batch_size:
             raise ValueError("Require 1 <= cells_per_image <= batch_size.")
         if seed < 0:
             raise ValueError("Seed must be nonnegative.")
+        if cell_workers < 0 or image_workers < 0:
+            raise ValueError("Worker counts must be nonnegative.")
         if max_image_per_gene is not None and max_image_per_gene < 1:
             raise ValueError("max_image_per_gene must be positive.")
         if max_cell_per_image is not None and max_cell_per_image < 1:
@@ -237,6 +293,8 @@ class CellBatchStream(IterableDataset):
         self.cache_capacity = (batch_size + cells_per_image - 1) // cells_per_image
         self.views = views if views is not None else CellViews()
         self.seed = seed
+        self.cell_workers = cell_workers
+        self.image_workers = image_workers
         self.epoch = 0
         self.stats = EpochStats()
 
@@ -250,7 +308,40 @@ class CellBatchStream(IterableDataset):
             raise RuntimeError("Use num_workers=0 so this stream owns a single image pool.")
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch]))
         self.stats = EpochStats()
-        pool = _ImagePool(self.records, rng, self.stats, self.max_cell_per_image)
+        readers = ThreadPoolExecutor(self.image_workers, thread_name_prefix="image-read") if self.image_workers else None
+        workers = ThreadPoolExecutor(self.cell_workers, thread_name_prefix="cell-view") if self.cell_workers else None
+        try:
+            pool = _ImagePool(self.records, rng, self.stats, self.max_cell_per_image, readers, self.image_workers)
+            crop_seeds = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch, 1]))
+            yield from self._batches(pool, rng, workers, crop_seeds)
+        finally:
+            for executor in (workers, readers):
+                if executor is not None:
+                    executor.shutdown(cancel_futures=True)
+
+    def _prepare(
+        self, image: _CachedImage, limit: int, rng: np.random.Generator
+    ) -> tuple[list[Tensor], list[Tensor], list[CellKey], int]:
+        global_views, local_views, cells = [], [], []
+        skipped = 0
+        for _ in range(limit):
+            while image.instances:
+                instance = image.instances.pop()
+                views = self.views(image.rgb, image.labels, instance.label, instance.box, rng)
+                if views is not None:
+                    global_views.append(views[0])
+                    local_views.append(views[1])
+                    cells.append(CellKey(image.record.gene, str(image.record.rgb_path), instance.label))
+                    break
+                skipped += 1
+            else:
+                break
+        return global_views, local_views, cells, skipped
+
+    def _batches(
+        self, pool: _ImagePool, rng: np.random.Generator,
+        workers: ThreadPoolExecutor | None, crop_seeds: np.random.Generator,
+    ) -> Iterator[CellBatch]:
         active: list[_CachedImage] = []
         while True:
             while len(active) < self.cache_capacity:
@@ -268,37 +359,65 @@ class CellBatchStream(IterableDataset):
             exhausted = []
             visiting, active = active, []
 
-            def take(image: _CachedImage) -> None:
-                limit = min(self.batch_size - len(cells), self.cells_per_image)
-                for _ in range(limit):
-                    while image.instances:
-                        instance = image.instances.pop()
-                        views = self.views(image.rgb, image.labels, instance.label, instance.box, rng)
-                        if views is None:
-                            self.stats.skipped_cells += 1
-                            continue
-                        global_views.append(views[0])
-                        local_views.append(views[1])
-                        cells.append(CellKey(image.record.gene, str(image.record.rgb_path), instance.label))
-                        break
-                    else:
-                        break
+            def retain(image: _CachedImage) -> None:
                 if image.instances:
                     active.append(image)
                 else:
                     exhausted.append(image.record.gene)
+                    pool.prefetch()
 
+            def collect(prepared: tuple[list[Tensor], list[Tensor], list[CellKey], int]) -> None:
+                image_global, image_local, image_cells, skipped = prepared
+                global_views.extend(image_global)
+                local_views.extend(image_local)
+                cells.extend(image_cells)
+                self.stats.skipped_cells += skipped
+
+            def crop_rng() -> np.random.Generator:
+                if workers is None:
+                    return rng
+                return np.random.default_rng(int(crop_seeds.integers(2**63)))
+
+            # Each worker owns one image at a time. Reserve only as many cells as the batch
+            # can accept, then collect in sampling order even when workers finish out of order.
             while visiting:
-                take(visiting.pop())
+                remaining = self.batch_size - len(cells)
+                if remaining == 0:
+                    retain(visiting.pop())
+                elif workers is None:
+                    image = visiting.pop()
+                    collect(self._prepare(image, min(remaining, self.cells_per_image), rng))
+                    retain(image)
+                    del image
+                else:
+                    jobs = []
+                    while visiting and remaining:
+                        image = visiting.pop()
+                        limit = min(remaining, self.cells_per_image)
+                        image_rng = crop_rng()
+                        jobs.append((image, limit, image_rng, workers.submit(self._prepare, image, limit, image_rng)))
+                        remaining -= limit
+                    for image, limit, image_rng, job in jobs:
+                        collect(job.result())
+                        # A short result from an earlier image can free space for the last job.
+                        extra = min(self.batch_size - len(cells), self.cells_per_image - limit)
+                        if extra and image.instances:
+                            collect(self._prepare(image, extra, image_rng))
+                        retain(image)
+                    jobs.clear()
+                    del image, job
             while len(cells) < self.batch_size and len(active) < self.cache_capacity:
                 image = pool.acquire()
                 if image is None:
                     break
                 self.stats.peak_cached_images = max(self.stats.peak_cached_images, len(active) + 1)
-                take(image)
+                limit = min(self.batch_size - len(cells), self.cells_per_image)
+                collect(self._prepare(image, limit, crop_rng()))
+                retain(image)
                 del image
             for gene in exhausted:
                 pool.release(gene)
+            pool.prefetch()
             if cells:
                 self.stats.emitted_cells += len(cells)
                 yield CellBatch(torch.stack(global_views), torch.stack(local_views), tuple(cells))

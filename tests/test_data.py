@@ -4,12 +4,15 @@ import tempfile
 import unittest
 import zlib
 from collections import Counter
+from contextlib import closing
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from threading import Event, Lock
 
 import numpy as np
 import torch
 
 from speckle_lejepa import CellBatchStream, CellViews, CropRule, load_image_index
+from train import training_batches
 
 
 def write_png(path: Path, array: np.ndarray) -> None:
@@ -147,6 +150,60 @@ class CellBatchStreamTests(unittest.TestCase):
         stream = CellBatchStream(path, batch_size=1, views=views)
         self.assertEqual(list(stream), [])
         self.assertEqual(stream.stats.skipped_cells, 1)
+
+    def test_thread_counts_preserve_sampling_and_views(self) -> None:
+        path, expected = self.make_index([
+            ("A", (513, 65535, 42)), ("B", (600, 7)), ("C", (999,)), ("A", (1, 2)), ("D", ()),
+        ])
+        for cell_counts in ((0, 0), (1, 4)):
+            with self.subTest(cell_counts=cell_counts):
+                streams = [
+                    CellBatchStream(path, batch_size=3, cells_per_image=2, cell_workers=c, image_workers=i)
+                    for c, i in zip(cell_counts, (0, 2))
+                ]
+                reference, threaded = [list(stream) for stream in streams]
+                self.assertEqual(streams[0].stats, streams[1].stats)
+                self.assertEqual(streams[1].stats.empty_images, 1)
+                self.assertEqual(streams[1].stats.emitted_cells, len(expected))
+                self.assertEqual(len(reference), len(threaded))
+                for a, b in zip(reference, threaded):
+                    self.assertEqual(a.cells, b.cells)
+                    torch.testing.assert_close(a.global_views, b.global_views, rtol=0, atol=0)
+                    torch.testing.assert_close(a.local_views, b.local_views, rtol=0, atol=0)
+                    self.assertLessEqual(max(Counter(cell.image_path for cell in b.cells).values()), 2)
+
+    def test_next_batch_prepares_cells_in_parallel_before_consumer_advances(self) -> None:
+        path, _ = self.make_index([("A", (1, 2)), ("B", (3, 4))])
+        views = CellViews()
+        lock = Lock()
+        next_batch_workers_started = Event()
+        finish_preparation = Event()
+        calls = 0
+
+        def controlled_views(*args):
+            nonlocal calls
+            with lock:
+                calls += 1
+                call_number = calls
+                if call_number == 4:
+                    next_batch_workers_started.set()
+            if call_number > 2 and not finish_preparation.wait(5):
+                raise RuntimeError("Timed out waiting for the test to release cell preparation")
+            return views(*args)
+
+        stream = CellBatchStream(path, batch_size=2, views=controlled_views, cell_workers=2, image_workers=2)
+        with closing(training_batches(stream)) as batches:
+            first, first_stats = next(batches)
+            try:
+                self.assertTrue(next_batch_workers_started.wait(5))
+                self.assertEqual(first_stats.emitted_cells, 2)
+            finally:
+                finish_preparation.set()
+            second, second_stats = next(batches)
+            self.assertEqual(second_stats.emitted_cells, 4)
+            self.assertEqual(first_stats.emitted_cells, 2)
+            self.assertEqual(len(set(first.cells + second.cells)), 4)
+            self.assertIsNone(next(batches, None))
 
 
 if __name__ == "__main__":

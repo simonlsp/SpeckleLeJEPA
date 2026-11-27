@@ -75,22 +75,7 @@ class CellViews:
     ) -> tuple[Tensor, np.ndarray]:
         y0, x0, y1, x1 = box
         side = max(self.cell_size, y1 - y0, x1 - x0)
-        top = (y0 + y1 - side) // 2
-        left = (x0 + x1 - side) // 2
-        height, width = labels.shape
-        start_y, end_y = max(0, top), min(height, top + side)
-        start_x, end_x = max(0, left), min(width, left + side)
-        target_y = slice(start_y - top, end_y - top)
-        target_x = slice(start_x - left, end_x - left)
-
-        mask = np.zeros((side, side), dtype=bool)
-        mask[target_y, target_x] = labels[start_y:end_y, start_x:end_x] == label
-        pixels = np.zeros((3, side, side), dtype=np.float32)
-        source = rgb[:, start_y:end_y, start_x:end_x]
-        pixels[:, target_y, target_x] = source
-        pixels /= np.iinfo(rgb.dtype).max
-        pixels *= mask
-        image = torch.from_numpy(pixels)
+        image, mask = masked_cell_crop(rgb, labels, label, box, side)
         if side != self.cell_size:
             mask = _resize_mask(mask, self.cell_size)
             image = _resize_rgb(image, self.cell_size).masked_fill(~torch.from_numpy(mask), 0)
@@ -124,6 +109,27 @@ class CellViews:
                 if output_mask.sum() >= math.ceil(output_side**2 * rule.min_foreground):
                     return y, x, side, output_mask
         return None
+
+
+def masked_cell_crop(
+    rgb: np.ndarray, labels: np.ndarray, label: int, box: tuple[int, int, int, int], side: int
+) -> tuple[Tensor, np.ndarray]:
+    """Center a square crop on the bounding box and zero everything outside the instance."""
+    y0, x0, y1, x1 = box
+    top = (y0 + y1 - side) // 2
+    left = (x0 + x1 - side) // 2
+    height, width = labels.shape
+    start_y, end_y = max(0, top), min(height, top + side)
+    start_x, end_x = max(0, left), min(width, left + side)
+    target_y = slice(start_y - top, end_y - top)
+    target_x = slice(start_x - left, end_x - left)
+    mask = np.zeros((side, side), dtype=bool)
+    mask[target_y, target_x] = labels[start_y:end_y, start_x:end_x] == label
+    pixels = np.zeros((3, side, side), dtype=np.float32)
+    pixels[:, target_y, target_x] = rgb[:, start_y:end_y, start_x:end_x]
+    pixels /= np.iinfo(rgb.dtype).max
+    pixels *= mask
+    return torch.from_numpy(pixels), mask
 
 
 def _resize_rgb(image: Tensor, size: int) -> Tensor:

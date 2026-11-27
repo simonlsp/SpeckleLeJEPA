@@ -119,6 +119,8 @@ python train.py /data/ImageIndex.npy --batch-size 4 --max-image-per-gene 2 --max
 
 `--max-image-per-gene` 按 `--seed` 为每个基因随机选择图像，所选图像在各轮固定。`--max-cell-per-image` 每轮从每张图取至多指定数量的实例参加裁剪，裁剪失败时产出的细胞数可能更少。省略任一参数时，对应范围内的样本全部参与。`--batch-size` 控制单设备每批最多处理的细胞数。
 
+训练当前批次时，后台会准备一个下一批次。`--cell-workers` 默认使用 4 个线程，从图片池中并行处理不同图片的细胞并生成遮罩视图。`--image-workers` 默认使用 2 个独立线程预读和解码候选补充图像，最多额外保存 2 对 RGB 和 mask。组批顺序和每图上限由同一个采样器控制。启用细胞线程后，裁剪使用按任务分配的随机种子，固定配置可复现，正数线程数之间结果一致。若续训需要沿用旧版串行随机序列，传入 `--cell-workers 0 --image-workers 0`。
+
 脚本默认使用 AdamW、学习率 `5e-4` 和随机种子 `0`。`--output` 是输出目录，默认为 `checkpoints/`。每轮训练结束会保存 `epoch_0001.pt`、`epoch_0002.pt` 等 checkpoint，其中 `model` 字段是模型的 `state_dict()`。训练日志同时输出到终端并追加到 `train.log`，记录训练配置、损失、耗时、细胞吞吐、显存峰值以及 checkpoint 操作。`--log_interval N` 可调整每隔多少批记录一次进度，默认为 100，每轮第一批也会记录。
 
 用 `--resume` 从输出目录中 epoch 编号最大的 checkpoint 继续，恢复模型、优化器、梯度缩放器和随机数状态。续训时传入与前次一致的 batch、采样上限和种子，可延续原采样配置。`--epochs` 表示最终要达到的 epoch 编号，省略时再训练一轮，新训练从第 1 轮开始。可用 `--max_saved_checkpoints N` 在每次成功保存后只保留最新的 N 个 `epoch_*.pt`，省略时保留全部。新训练请使用新的输出目录，继续使用已有 checkpoint 的目录时添加 `--resume`。
